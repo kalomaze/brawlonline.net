@@ -839,6 +839,7 @@ std::vector<std::pair<u32, u32>> RollbackManager::AllRamScanRuns() const
 void RollbackManager::ScanDirtyMarks(u32 lo, u32 hi, std::vector<u32>* out)
 {
   auto& bitmap = JITDirtyBitmap::Get();
+  u64 bitmap_bytes = 0;
   const u8* const mask = RegionMask();
   const u32 mem1_pages = static_cast<u32>(m_mem1_size / ROLLBACK_PAGE_SIZE);
   if (out)
@@ -849,11 +850,22 @@ void RollbackManager::ScanDirtyMarks(u32 lo, u32 hi, std::vector<u32>* out)
       continue;
     const u32 a = std::max(first, lo);
     const u32 b = std::min(end, hi);
+    bitmap_bytes += b - a;
     bitmap.ScanAndClear(a, b - a, [&](u32 entry) {
       const u32 granule = entry < MEM2_FIRST_PAGE ? entry : mem1_pages + (entry - MEM2_FIRST_PAGE);
       if (out && (!mask || mask[granule]))
         out->push_back(entry);
     });
+  }
+  if (out)
+  {
+    m_stat_save_bitmap_bytes_total.fetch_add(bitmap_bytes, std::memory_order_relaxed);
+    m_stat_save_candidate_bytes_total.fetch_add(out->size() * ROLLBACK_PAGE_SIZE,
+                                                std::memory_order_relaxed);
+  }
+  else
+  {
+    m_stat_load_bitmap_bytes_total.fetch_add(bitmap_bytes, std::memory_order_relaxed);
   }
 }
 
@@ -907,11 +919,36 @@ void RollbackManager::ToggleFrameSave()
   {
     m_ring_next = 0;
     m_ring_count = 0;
-    for (auto* stat : {&m_stat_save_count, &m_stat_save_us_total, &m_stat_save_us_max,
-                       &m_stat_load_count, &m_stat_load_us_total, &m_stat_load_us_max,
-                       &m_stat_sync_count, &m_stat_sync_us_total, &m_stat_sync_us_max,
-                       &m_stat_evict_waits, &m_stat_evict_wait_us_max, &m_stat_save_gran_total,
-                       &m_stat_save_gran_max, &m_stat_load_gran_total, &m_stat_load_gran_max})
+    for (auto* stat : {&m_stat_save_count,
+                       &m_stat_save_us_total,
+                       &m_stat_save_us_max,
+                       &m_stat_load_count,
+                       &m_stat_load_us_total,
+                       &m_stat_load_us_max,
+                       &m_stat_sync_count,
+                       &m_stat_sync_us_total,
+                       &m_stat_sync_us_max,
+                       &m_stat_evict_waits,
+                       &m_stat_evict_wait_us_max,
+                       &m_stat_save_gran_total,
+                       &m_stat_save_gran_max,
+                       &m_stat_load_gran_total,
+                       &m_stat_load_gran_max,
+                       &m_stat_save_candidate_bytes_total,
+                       &m_stat_save_bitmap_bytes_total,
+                       &m_stat_load_bitmap_bytes_total,
+                       &m_stat_load_written_bytes_total,
+                       &m_stat_save_payload_bytes_total,
+                       &m_stat_save_index_bytes_total,
+                       &m_stat_save_cpu_bytes_total,
+                       &m_stat_save_device_bytes_total,
+                       &m_stat_save_payload_incomplete_count,
+                       &m_stat_save_region_count,
+                       &m_stat_save_initial_candidate_bytes_total,
+                       &m_stat_save_initial_bitmap_bytes_total,
+                       &m_stat_save_initial_count,
+                       &m_stat_save_initial_us_total,
+                       &m_stat_save_initial_payload_bytes_total})
     {
       stat->store(0, std::memory_order_relaxed);
     }
@@ -983,6 +1020,27 @@ RollbackManager::TimingStats RollbackManager::GetTimingStats() const
   stats.save_granules_max = m_stat_save_gran_max.load(std::memory_order_relaxed);
   stats.load_granules_total = m_stat_load_gran_total.load(std::memory_order_relaxed);
   stats.load_granules_max = m_stat_load_gran_max.load(std::memory_order_relaxed);
+  stats.save_candidate_bytes_total =
+      m_stat_save_candidate_bytes_total.load(std::memory_order_relaxed);
+  stats.save_bitmap_bytes_total = m_stat_save_bitmap_bytes_total.load(std::memory_order_relaxed);
+  stats.load_bitmap_bytes_total = m_stat_load_bitmap_bytes_total.load(std::memory_order_relaxed);
+  stats.load_written_bytes_total = m_stat_load_written_bytes_total.load(std::memory_order_relaxed);
+  stats.save_payload_bytes_total = m_stat_save_payload_bytes_total.load(std::memory_order_relaxed);
+  stats.save_index_bytes_total = m_stat_save_index_bytes_total.load(std::memory_order_relaxed);
+  stats.save_cpu_bytes_total = m_stat_save_cpu_bytes_total.load(std::memory_order_relaxed);
+  stats.save_device_bytes_total = m_stat_save_device_bytes_total.load(std::memory_order_relaxed);
+  stats.save_payload_incomplete_count =
+      m_stat_save_payload_incomplete_count.load(std::memory_order_relaxed);
+  stats.save_region_count = m_stat_save_region_count.load(std::memory_order_relaxed);
+  stats.save_initial_candidate_bytes_total =
+      m_stat_save_initial_candidate_bytes_total.load(std::memory_order_relaxed);
+  stats.save_initial_bitmap_bytes_total =
+      m_stat_save_initial_bitmap_bytes_total.load(std::memory_order_relaxed);
+  stats.save_initial_count = m_stat_save_initial_count.load(std::memory_order_relaxed);
+  stats.save_initial_us_total = m_stat_save_initial_us_total.load(std::memory_order_relaxed);
+  stats.save_initial_payload_bytes_total =
+      m_stat_save_initial_payload_bytes_total.load(std::memory_order_relaxed);
+
   return stats;
 }
 
@@ -1030,6 +1088,11 @@ void RollbackManager::SaveFrame(Core::System& system, s64 tag)
   if (!m_initialized)
     return;
   const auto timing_start = std::chrono::steady_clock::now();
+
+  const bool initial_save = !m_base_snapshot.valid;
+  const u64 candidate_before = m_stat_save_candidate_bytes_total.load(std::memory_order_relaxed);
+  const u64 bitmap_before = m_stat_save_bitmap_bytes_total.load(std::memory_order_relaxed);
+  u64 measured_payload_bytes = 0;
 
   // Lazy init on the first frame, so we can be sure the game is fully booted when taking the base
   // snapshot
@@ -1151,8 +1214,31 @@ void RollbackManager::SaveFrame(Core::System& system, s64 tag)
     m_stat_save_gran_total.fetch_add(dirty_pages, std::memory_order_relaxed);
     if (dirty_pages > m_stat_save_gran_max.load(std::memory_order_relaxed))
       m_stat_save_gran_max.store(dirty_pages, std::memory_order_relaxed);
-    const size_t total_bytes = static_cast<size_t>(dirty_pages) * ROLLBACK_PAGE_SIZE +
-                               saved.m_l1_cache_snapshot.size() + saved.m_save_buffer.size();
+    // Logical saved state, not allocated capacity or just the RAM component. These
+    // fields are copied on every Save, including in gameplay region mode.
+    const u64 index_bytes = static_cast<u64>(dirty_pages) * sizeof(u32);
+    const u64 cpu_bytes = sizeof(saved.m_cpu) + sizeof(saved.brawl_frame) +
+                          sizeof(saved.m_downcount) + sizeof(saved.m_jit_invalidations) +
+                          sizeof(saved.m_jit_code_mark) + sizeof(saved.m_slice_length) +
+                          sizeof(saved.m_exceptions) + sizeof(saved.m_msr) +
+                          sizeof(saved.m_all_spr) + sizeof(saved.m_pc) + sizeof(saved.m_npc) +
+                          sizeof(saved.m_reserve_address) + sizeof(saved.m_reserve);
+    const u64 device_bytes =
+        m_region_mode ? 0 : saved.m_last_device_payload_bytes + saved.m_l1_cache_size;
+    // Whole-machine asynchronous GPU/ARAM/VMEM capture needs its own accounting.
+    // Never silently present a partial total as complete in those modes.
+    if (!m_region_mode &&
+        (saved.m_split_video || saved.m_aram.data || !saved.m_fake_vmem.chunks.empty()))
+      m_stat_save_payload_incomplete_count.fetch_add(1, std::memory_order_relaxed);
+    if (m_region_mode)
+      m_stat_save_region_count.fetch_add(1, std::memory_order_relaxed);
+    measured_payload_bytes =
+        static_cast<u64>(dirty_pages) * ROLLBACK_PAGE_SIZE + index_bytes + cpu_bytes + device_bytes;
+    m_stat_save_payload_bytes_total.fetch_add(measured_payload_bytes, std::memory_order_relaxed);
+    m_stat_save_index_bytes_total.fetch_add(index_bytes, std::memory_order_relaxed);
+    m_stat_save_cpu_bytes_total.fetch_add(cpu_bytes, std::memory_order_relaxed);
+    m_stat_save_device_bytes_total.fetch_add(device_bytes, std::memory_order_relaxed);
+    const u64 total_bytes = measured_payload_bytes;
     DEBUG_LOG_FMT(BRAWLBACK,
                  "SaveFrame: slot {} dirty granules {} (mem1 {}, mem2 {}), size {:.2f} MB", slot,
                  dirty_pages, saved.m_mem1_delta.page_count, saved.m_mem2_delta.page_count,
@@ -1161,6 +1247,19 @@ void RollbackManager::SaveFrame(Core::System& system, s64 tag)
 
   const u64 save_us = RecordTiming(timing_start, m_stat_save_count, m_stat_save_us_total,
                                    m_stat_save_us_max);
+  if (initial_save)
+  {
+    m_stat_save_initial_candidate_bytes_total.fetch_add(
+        m_stat_save_candidate_bytes_total.load(std::memory_order_relaxed) - candidate_before,
+        std::memory_order_relaxed);
+    m_stat_save_initial_bitmap_bytes_total.fetch_add(
+        m_stat_save_bitmap_bytes_total.load(std::memory_order_relaxed) - bitmap_before,
+        std::memory_order_relaxed);
+    m_stat_save_initial_count.fetch_add(1, std::memory_order_relaxed);
+    m_stat_save_initial_us_total.fetch_add(save_us, std::memory_order_relaxed);
+    m_stat_save_initial_payload_bytes_total.fetch_add(measured_payload_bytes,
+                                                      std::memory_order_relaxed);
+  }
   {
     const auto& saved = m_slots[slot];
     if (saved.m_last_sync_waited)
@@ -1614,9 +1713,10 @@ bool RollbackManager::LoadFrame(Core::System& system, int frames_back)
       for (u32 offset = 0; offset < total; offset += chunk)
       {
         const u32 count = std::min(chunk, total - offset);
-        page_jobs.push_back(w.create_job_as_child(
-            j, [this, sorted_exclude_regions, offset, count, shadow_base](job::JobTaskThread&,
-                                                                          job::Job&) {
+        page_jobs.push_back(
+            w.create_job_as_child(j, [this, sorted_exclude_regions, offset, count,
+                                      shadow_base](job::JobTaskThread&, job::Job&) {
+              u64 written_bytes = 0;
               for (u32 n = offset; n < offset + count; n++)
               {
                 const u32 page_key = restore_keys[n];
@@ -1657,7 +1757,10 @@ bool RollbackManager::LoadFrame(Core::System& system, int frames_back)
                     for (u32 b = 0; b < ROLLBACK_PAGE_SIZE; ++b)
                     {
                       if (bits & (1ULL << b))
+                      {
                         dst[b] = src[b];
+                        ++written_bytes;
+                      }
                       else if (dst[b] != src[b])
                         outside_differs = true;
                     }
@@ -1699,12 +1802,25 @@ bool RollbackManager::LoadFrame(Core::System& system, int frames_back)
                 for (const MemoryRegion& r : *sorted_exclude_regions)
                   excluded |= dst_phys < r.phys_end && dst_phys + ROLLBACK_PAGE_SIZE > r.phys_start;
                 if (excluded)
+                {
                   savestateMemcpy(dst, src, ROLLBACK_PAGE_SIZE, dst_phys, *sorted_exclude_regions);
+                  for (u32 b = 0; b < ROLLBACK_PAGE_SIZE; ++b)
+                  {
+                    bool skip = false;
+                    for (const MemoryRegion& r : *sorted_exclude_regions)
+                      skip |= dst_phys + b >= r.phys_start && dst_phys + b < r.phys_end;
+                    written_bytes += !skip;
+                  }
+                }
                 else
+                {
                   std::memcpy(dst, src, ROLLBACK_PAGE_SIZE);
+                  written_bytes += ROLLBACK_PAGE_SIZE;
+                }
                 if (shadow)
                   std::memcpy(shadow, dst, ROLLBACK_PAGE_SIZE);
               }
+              m_stat_load_written_bytes_total.fetch_add(written_bytes, std::memory_order_relaxed);
             }));
       }
 

@@ -371,7 +371,7 @@ void DeltaSaveSlot::Save(Core::System& system)
     m_split_video = split;
     rbm.BeginDoState();
     VideoCommon_SetRollbackSplitState(split);
-    State::SaveToBuffer(system, m_save_buffer);
+    m_last_device_payload_bytes = State::SaveToBuffer(system, m_save_buffer);
     VideoCommon_SetRollbackSplitState(false);
     rbm.EndDoState();
     m_last_aram_bytes = system.GetDSP().SaveARAMSnapshot(m_aram);

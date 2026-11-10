@@ -14,6 +14,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
+#ifdef BRAWL_RECOMP_INTEROP
+#include "brawl_rollback_udp.h"
+#endif
 #include <limits>
 #include <map>
 #include <memory>
@@ -852,6 +856,7 @@ struct State
     std::string end_method;
     s64 final_frame = -1;
     bool play_anyway = false;
+    bool rollback_benchmark = false;  // explicit harness mode: original replay through SyncTest
     // A room's game watched from the room CSS (ArmPlayback's `room_watch`, Online/RoomWatch.h):
     // the game leaves the room CSS for its match and comes back to it.
     bool room_watch = false;
@@ -1459,6 +1464,7 @@ int ApplyTaskOrder(Core::System& system, const std::vector<std::vector<std::stri
 // Stage* of the match (sora_melee .bss), and the fighter start point table in it (stMelee).
 constexpr u32 STAGE_PTR = 0x80B8A428;
 constexpr u32 STAGE_START_POS = 0x1B4;
+bool s_crossplay_stage_seen = false;
 
 std::optional<u32> StageStartPosAddr(const Guest& g)
 {
@@ -3746,10 +3752,36 @@ int LocalPad()
                                       std::clamp(s.net_opts.local_pad, 0, 3);
 }
 
+// Opt-in interoperability harness: raw Gekko packets, the production rollback
+// scheduler/snapshot/checksum path, and a prerecorded local controller only.
+bool RawInterop()
+{
+#ifdef BRAWL_RECOMP_INTEROP
+  return std::getenv("BRAWL_INTEROP_PORT") != nullptr;
+#else
+  return false;
+#endif
+}
+const u8* InteropPad(int frame, int port)
+{
+  static const std::vector<u8> bytes = [] {
+    const char* path = std::getenv("BRAWL_ROLLBACK_INPUT");
+    if (!path)
+      return std::vector<u8>{};
+    std::ifstream stream(path, std::ios::binary);
+    return std::vector<u8>(std::istreambuf_iterator<char>(stream), {});
+  }();
+  const size_t offset = 16 + size_t(frame) * 256 + port * 64;
+  if (frame < 0 || bytes.size() < 16 || std::memcmp(bytes.data(), "BRPAD001", 8) ||
+      offset + 64 > bytes.size())
+    return nullptr;
+  return bytes.data() + offset;
+}
+
 bool CreateGekko(bool stress, int num_players)
 {
   DestroyGekko();
-  if (!gekko_create(&s.gekko, stress ? GekkoStressSession : GekkoGameSession))
+  if (!gekko_create(&s.gekko, stress && !RawInterop() ? GekkoStressSession : GekkoGameSession))
     return false;
   GekkoConfig cfg{};
   cfg.num_players = static_cast<unsigned char>(num_players);
@@ -3766,7 +3798,36 @@ bool CreateGekko(bool stress, int num_players)
   s.local_handles.clear();
   s.handle_port.fill(-1);
   s.remote_handle = -1;
-  if (stress)
+#ifdef BRAWL_RECOMP_INTEROP
+  if (stress && RawInterop())
+  {
+    const auto env = [](const char* key, int fallback) {
+      const char* v = std::getenv(key);
+      return v ? std::atoi(v) : fallback;
+    };
+    const int local = env("BRAWL_INTEROP_SLOT", 0);
+    if (local < 0 || local > 1 || !InteropPad(0, local))
+      return false;
+    gekko_net_adapter_set(s.gekko, BrawlRollback::OpenUdp(env("BRAWL_INTEROP_PORT", 0),
+                                                          env("BRAWL_INTEROP_PEER_PORT", 0),
+                                                          env("BRAWL_INTEROP_DELAY_MS", 0)));
+    gekko_set_disconnect_timeout(s.gekko, 60000);
+    gekko_set_frame_limit(s.gekko, env("BRAWL_ROLLBACK_FRAMES", 600));
+    for (int port = 0; port < 2; ++port)
+    {
+      const int h = gekko_add_actor(s.gekko, port == local ? GekkoLocalPlayer : GekkoRemotePlayer,
+                                    port == local ? nullptr : BrawlRollback::PeerAddress());
+      if (port == local)
+        s.local_handles.push_back(h);
+      else
+        s.remote_handle = h;
+      s.handle_port[h] = port;
+    }
+    s.gekko_started = true;
+  }
+  else
+#endif
+      if (stress)
   {
     for (int port = 0; port < 4; ++port)
     {
@@ -4816,6 +4877,18 @@ void PerformQueuedSave(Core::System& system)
   const Guest g(system.GetMemory());
   FrameRecord rec;
   const u32 crc = FrameChecksum(g, &rec);
+  if (s.pb.rollback_benchmark)
+  {
+    const s64 frame = s.queued_save.frame - s.pb.file->first_frame;
+    if (frame < 0 || static_cast<size_t>(frame) >= s.pb.file->checksums.size() ||
+        crc != s.pb.file->checksums[static_cast<size_t>(frame)])
+    {
+      ERROR_LOG_FMT(BRAWLBACK, "recorded rollback benchmark checksum mismatch at frame {}",
+                    s.queued_save.frame);
+      std::abort();
+    }
+    ++s.pb.frames_checked;
+  }
   if (s.queued_save.checksum)
     *s.queued_save.checksum = crc;
   RegionDump(system, s.queued_save.frame);
@@ -5591,7 +5664,17 @@ bool HandleGekkoFrame(Core::System& system)
       }
       else
       {
-        gekko_add_local_input(s.gekko, h, in);
+        if (RawInterop())
+        {
+          const int frame = gekko_current_frame(s.gekko);
+          const auto* pad = InteropPad(frame, s.handle_port[h]);
+          const char* max = std::getenv("BRAWL_ROLLBACK_FRAMES");
+          if (pad && frame < (max ? std::atoi(max) : 600) &&
+              gekko_local_input_frame(s.gekko, h) < frame)
+            gekko_add_local_input(s.gekko, h, const_cast<u8*>(pad));
+        }
+        else
+          gekko_add_local_input(s.gekko, h, in);
       }
     }
     const int frame_before = s.mode == Mode::Network ? gekko_current_frame(s.gekko) : -1;
@@ -7812,6 +7895,16 @@ bool RunFrame(const Core::CPUThreadGuard& guard)
       ++s.mispredicted_passes;
     }
   }
+  if (s.pb.rollback_benchmark)
+  {
+    const s64 frame = s.ops.adv_frame[i] - s.pb.file->first_frame;
+    if (frame < 0 || static_cast<size_t>(frame) >= s.pb.file->pads.size())
+    {
+      ERROR_LOG_FMT(BRAWLBACK, "recorded rollback benchmark exhausted its recorded inputs");
+      std::abort();
+    }
+    slots = s.pb.file->pads[static_cast<size_t>(frame)];
+  }
   PadsSetCurrent(0xF, slots);
   PadsOnLoopTop(system);
   if (s.mode == Mode::SyncTest && std::getenv("PPR_GPRB_INPUT_LOG"))
@@ -8865,7 +8958,7 @@ PlaybackView GetPlaybackView()
 {
   std::lock_guard<std::recursive_timed_mutex> lk(s.mutex);
   PlaybackView v;
-  if (s.mode != Mode::Playback)
+  if (s.mode != Mode::Playback && !s.pb.rollback_benchmark)
     return v;
   v.active = true;
   v.serial = s.pb.serial;
@@ -9065,6 +9158,28 @@ picojson::value Status()
   o["save_granules_max"] = picojson::value(static_cast<double>(t.save_granules_max));
   o["load_granules_total"] = picojson::value(static_cast<double>(t.load_granules_total));
   o["load_granules_max"] = picojson::value(static_cast<double>(t.load_granules_max));
+  o["save_candidate_bytes_total"] =
+      picojson::value(static_cast<double>(t.save_candidate_bytes_total));
+  o["save_bitmap_bytes_total"] = picojson::value(static_cast<double>(t.save_bitmap_bytes_total));
+  o["load_bitmap_bytes_total"] = picojson::value(static_cast<double>(t.load_bitmap_bytes_total));
+  o["load_written_bytes_total"] = picojson::value(static_cast<double>(t.load_written_bytes_total));
+  o["save_payload_bytes_total"] = picojson::value(static_cast<double>(t.save_payload_bytes_total));
+  o["save_index_bytes_total"] = picojson::value(static_cast<double>(t.save_index_bytes_total));
+  o["save_cpu_bytes_total"] = picojson::value(static_cast<double>(t.save_cpu_bytes_total));
+  o["save_device_bytes_total"] = picojson::value(static_cast<double>(t.save_device_bytes_total));
+  o["save_payload_incomplete_count"] =
+      picojson::value(static_cast<double>(t.save_payload_incomplete_count));
+  o["save_region_count"] = picojson::value(static_cast<double>(t.save_region_count));
+  o["save_initial_candidate_bytes_total"] =
+      picojson::value(static_cast<double>(t.save_initial_candidate_bytes_total));
+  o["save_initial_bitmap_bytes_total"] =
+      picojson::value(static_cast<double>(t.save_initial_bitmap_bytes_total));
+  o["save_initial_count"] = picojson::value(static_cast<double>(t.save_initial_count));
+  o["save_initial_us_total"] = picojson::value(static_cast<double>(t.save_initial_us_total));
+  o["save_initial_payload_bytes_total"] =
+      picojson::value(static_cast<double>(t.save_initial_payload_bytes_total));
+
+  o["snapshot_region_mode"] = picojson::value(Rollback::RollbackManager::Get().IsRegionMode());
   o["frame_cost"] = FrameCostJson();
   if (s.mode == Mode::Network)
   {
@@ -9961,6 +10076,20 @@ bool PlaybackLoopTop(const Core::CPUThreadGuard& guard)
                           "countdown until game frame {}",
                s.match_ports, relinked, StartFrame());
   s.pb.started = true;
+  if (const char* benchmark = std::getenv("PPR_REPLAY_ROLLBACK_BENCHMARK"))
+  {
+    if (std::string_view(benchmark) != "1")
+      return fail("PPR_REPLAY_ROLLBACK_BENCHMARK must be 1");
+    // Reuse the existing Gekko sync-test scheduler and production snapshot store.
+    // The recording already supplied the exact setup, seed, task order and countdown.
+    s.pb.rollback_benchmark = true;
+    s.st_opts = SyncTestOptions{};
+    s.st_opts.distance = 3;
+    s.st_opts.hash_regions = false;
+    s.st_opts.start_frame = s.pb.start_frame;
+    s.st_opts.ports = s.pb.ports;
+    s.mode = Mode::SyncTest;
+  }
   // A spectator who joined a game well under way catches up to the live edge at once; one there
   // from its start watches it from the start (docs/design/spectating.md §6.2).
   if (s.pb.live && s.pb.catch_up_at_start && s.pb.file->pads.size() > LIVE_JOIN_CATCH_UP_FRAMES)
@@ -10087,6 +10216,30 @@ bool OnLoopTop(const Core::CPUThreadGuard& guard)
   std::lock_guard<std::recursive_timed_mutex> lk(s.mutex);
   auto& system = guard.GetSystem();
   auto& ppc = system.GetPPCState();
+  if (const char* seed = std::getenv("BRAWL_CROSSPLAY_SEED"))
+  {
+    static bool synced = false;
+    const Guest g(system.GetMemory());
+    if (!synced && s_crossplay_stage_seen && IsSceneMelee(g) &&
+        g.U32(Addr::GAME_FRAME + 4).value_or(99) == 1)
+    {
+      if (const auto sp = StageStartPosAddr(g))
+      {
+        const auto values = MatchSeeds(static_cast<u32>(std::strtoul(seed, nullptr, 0)), 0);
+        WriteU32(system, Addr::MTRAND_DEFAULT_SEED, values[0]);
+        WriteU32(system, Addr::MTRAND_OTHER_SEED, values[1]);
+        WriteU32(system, Addr::LIBC_RAND_NEXT, values[2]);
+        WriteU32(system, Addr::OBJECT_SERIAL_COUNTER, 0x10000);
+        for (u32 i = 0; i < 4; ++i)
+          WriteU32(system, *sp + i * 4, i);
+        WriteU32(system, Addr::GAME_FRAME + 0x14, 2);
+        if (const auto app = g.Ptr32(Addr::APPLICATION_PTR))
+          WriteU32(system, *app + 0x100, 1000);
+        synced = true;
+        INFO_LOG_FMT(BRAWLBACK, "crossplay: controlled initial barrier applied");
+      }
+    }
+  }
   NoteLoopTop(system);
   ResimHide::Restore(system);
 
@@ -10678,6 +10831,16 @@ bool OnLoopEnd(const Core::CPUThreadGuard& guard)
 
 void OnStageCreate(const Core::CPUThreadGuard& guard)
 {
+  s_crossplay_stage_seen = true;
+  if (const char* seed = std::getenv("BRAWL_CROSSPLAY_SEED"))
+  {
+    const auto values = MatchSeeds(static_cast<u32>(std::strtoul(seed, nullptr, 0)), 0);
+    auto& system = guard.GetSystem();
+    WriteU32(system, Addr::MTRAND_DEFAULT_SEED, values[0]);
+    WriteU32(system, Addr::MTRAND_OTHER_SEED, values[1]);
+    WriteU32(system, Addr::LIBC_RAND_NEXT, values[2]);
+    WriteU32(system, Addr::OBJECT_SERIAL_COUNTER, 0x10000);
+  }
   std::lock_guard<std::recursive_timed_mutex> lk(s.mutex);
   if (s.mode == Mode::Playback)
   {

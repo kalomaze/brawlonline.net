@@ -1,0 +1,29 @@
+Dolphin crossplay debugging with BrawlRecompiled
+
+This branch adds recorded-match rollback benchmarks, snapshot accounting, and
+an opt-in loopback transport for debugging Dolphin against BrawlRecompiled.
+
+To run a paired replay comparison, use tools/rollback-repro/example.toml from
+kalomaze/BrawlRecompiled on the rollback-dolphin-crossplay branch. Its Dolphin
+client must use a build from this branch. The runner supplies the original
+.brep and enables PPR_REPLAY_ROLLBACK_BENCHMARK=1. Dolphin applies the recorded
+setup and countdown, then runs the existing Gekko sync test with a rollback
+distance of three frames. A recorded checksum mismatch aborts the process.
+
+The gameplay status response reports saved RAM, indices, CPU and device payload,
+actual guest RAM bytes written during restore, scanned candidate bytes, bitmap
+bytes, and initialization separately. save_payload_incomplete_count flags modes
+whose asynchronous GPU or auxiliary memory payload is not fully accounted for.
+
+To build the raw loopback transport, place BrawlRecompiled alongside this checkout
+and configure Dolphin with -DBRAWL_RECOMP_INTEROP=ON. This compiles the recomp's
+brawl_rollback_udp.cpp into Dolphin. Set BRAWL_INTEROP_PORT and
+BRAWL_INTEROP_PEER_PORT to opposite UDP ports on the two clients,
+BRAWL_INTEROP_SLOT to Dolphin's player slot (0 or 1), and BRAWL_ROLLBACK_INPUT
+to the prepared BRPAD001 recording. BRAWL_ROLLBACK_FRAMES limits the run;
+BRAWL_INTEROP_DELAY_MS injects transport delay. This transport is selected when
+starting a sync test with BRAWL_INTEROP_PORT set.
+
+BRAWL_CROSSPLAY_SEED enables the controlled seed and stage-start barrier used
+by the initial crossplay probes. Recorded replay benchmarks use the recording's
+setup instead.

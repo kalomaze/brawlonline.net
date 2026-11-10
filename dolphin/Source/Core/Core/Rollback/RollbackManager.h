@@ -150,6 +150,21 @@ public:
     // set's) and a load restored (written since the target frame).
     u64 save_granules_total = 0, save_granules_max = 0;
     u64 load_granules_total = 0, load_granules_max = 0;
+    u64 save_candidate_bytes_total = 0;
+    u64 save_bitmap_bytes_total = 0;
+    u64 load_bitmap_bytes_total = 0;
+    u64 load_written_bytes_total = 0;
+    u64 save_payload_bytes_total = 0;
+    u64 save_index_bytes_total = 0;
+    u64 save_cpu_bytes_total = 0;
+    u64 save_device_bytes_total = 0;
+    u64 save_payload_incomplete_count = 0;
+    u64 save_region_count = 0;
+    u64 save_initial_candidate_bytes_total = 0;
+    u64 save_initial_bitmap_bytes_total = 0;
+    u64 save_initial_count = 0;
+    u64 save_initial_us_total = 0;
+    u64 save_initial_payload_bytes_total = 0;
   };
   TimingStats GetTimingStats() const;
 
@@ -208,6 +223,22 @@ public:
   std::atomic<u64> m_stat_evict_waits{0}, m_stat_evict_wait_us_max{0};
   std::atomic<u64> m_stat_save_gran_total{0}, m_stat_save_gran_max{0};
   std::atomic<u64> m_stat_load_gran_total{0}, m_stat_load_gran_max{0};
+  std::atomic<u64> m_stat_save_candidate_bytes_total{0};
+  std::atomic<u64> m_stat_save_bitmap_bytes_total{0};
+  std::atomic<u64> m_stat_load_bitmap_bytes_total{0};
+  std::atomic<u64> m_stat_load_written_bytes_total{0};
+  std::atomic<u64> m_stat_save_payload_bytes_total{0};
+  std::atomic<u64> m_stat_save_index_bytes_total{0};
+  std::atomic<u64> m_stat_save_cpu_bytes_total{0};
+  std::atomic<u64> m_stat_save_device_bytes_total{0};
+  std::atomic<u64> m_stat_save_payload_incomplete_count{0};
+  std::atomic<u64> m_stat_save_region_count{0};
+  std::atomic<u64> m_stat_save_initial_candidate_bytes_total{0};
+  std::atomic<u64> m_stat_save_initial_bitmap_bytes_total{0};
+  std::atomic<u64> m_stat_save_initial_count{0};
+  std::atomic<u64> m_stat_save_initial_us_total{0};
+  std::atomic<u64> m_stat_save_initial_payload_bytes_total{0};
+
   // The last load's parts (CPU thread): its wait for the video thread, its device states, the
   // granules it restored and, of those, the ones whose bytes it changed, and (whole-machine mode)
   // its JIT step and whether that dropped the restored granules' blocks.

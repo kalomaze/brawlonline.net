@@ -368,6 +368,7 @@ public:
   Common::UniqueBuffer<uint8_t> m_l1_cache_snapshot;  // outside fastmem arena, not bitmap-tracked
   Common::UniqueBuffer<uint8_t> m_save_buffer;        // non-RAM state (CPU, HW, IOS, etc.)
   DSP::ARAMSnapshot m_aram;  // a GameCube's ARAM, not in m_save_buffer (bug report #135)
+  size_t m_last_device_payload_bytes = 0;  // logical bytes returned by SaveToBuffer
   u64 m_last_aram_bytes = 0;  // ARAM copied by the last Save
   // A GameCube game's fake VMEM, which DoState skips with RAM (bug report #207).
   Memory::FakeVMEMSnapshot m_fake_vmem;

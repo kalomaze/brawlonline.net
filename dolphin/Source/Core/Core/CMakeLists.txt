@@ -1040,3 +1040,14 @@ if(USE_RETRO_ACHIEVEMENTS)
     target_compile_definitions(core PUBLIC -DRC_CLIENT_SUPPORTS_RAINTEGRATION)
   endif()
 endif()
+
+# Local opt-in cross-engine test transport; production networking is unchanged.
+option(BRAWL_RECOMP_INTEROP "Build the sibling recomp's raw-loopback interoperability adapter" OFF)
+if(BRAWL_RECOMP_INTEROP)
+  set(RECOMP_RUNTIME "${CMAKE_SOURCE_DIR}/../../BrawlRecompiled/wiicompiled/runtime")
+  target_sources(core PRIVATE "${RECOMP_RUNTIME}/src/brawl_rollback_udp.cpp")
+  set_property(SOURCE Rollback/GameplaySession.cpp APPEND PROPERTY COMPILE_DEFINITIONS BRAWL_RECOMP_INTEROP)
+  set_property(SOURCE Rollback/GameplaySession.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${RECOMP_RUNTIME}/include")
+  set_source_files_properties("${RECOMP_RUNTIME}/src/brawl_rollback_udp.cpp" PROPERTIES
+    INCLUDE_DIRECTORIES "${RECOMP_RUNTIME}/include" COMPILE_OPTIONS "-fexceptions")
+endif()
