@@ -304,12 +304,15 @@ pub fn choose_remote_addresses(resp: &GetTicketResp) -> Vec<String> {
 }
 
 fn punch(host: &mut Host<EnetSocket>, remote: SocketAddr, timeout: Duration) -> P2pResult {
+    // Opt-in private gameplay integration: Dolphin completes at ENet Connect,
+    // unlike the generic test peer that exchanges pp-hello.
+    let gameplay = std::env::var_os("BRAWL_PRIVATE_GAMEPLAY_PUNCH").is_some();
     let start = Instant::now();
     let _ = host.connect(remote, MM_CHANNEL_COUNT, 0);
     let mut connected: Option<PeerID> = None;
     let mut got_hello = false;
     let mut sent_hello = false;
-    while start.elapsed() < timeout && !(got_hello && sent_hello) {
+    while start.elapsed() < timeout && !(if gameplay { connected.is_some() } else { got_hello && sent_hello }) {
         match host.service() {
             Ok(Some(Event::Connect { peer, .. })) => {
                 if peer.address() == Some(remote) && connected.is_none() {
@@ -327,11 +330,11 @@ fn punch(host: &mut Host<EnetSocket>, remote: SocketAddr, timeout: Duration) -> 
             _ => std::thread::sleep(Duration::from_millis(2)),
         }
     }
-    let ok = got_hello && sent_hello;
+    let ok = if gameplay { connected.is_some() } else { got_hello && sent_hello };
     let elapsed_ms = start.elapsed().as_millis() as u64;
     // Let the hello flush, then close politely.
     let linger = Instant::now();
-    while linger.elapsed() < Duration::from_millis(300) {
+    while linger.elapsed() < Duration::from_millis(if gameplay { 600 } else { 300 }) {
         if !matches!(host.service(), Ok(Some(_))) {
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -418,6 +421,9 @@ fn search_once(opts: &SearchOptions) -> anyhow::Result<SearchResult> {
                 disconnect_mm(&mut host, mm);
                 return Ok(result);
             }
+            if std::env::var_os("BRAWL_PRIVATE_GAMEPLAY_PUNCH").is_some() {
+                eprintln!("private-gameplay: ticket accepted");
+            }
         }
         Recv::Disconnected => {
             result.status = Status::MmDisconnected;
@@ -433,11 +439,23 @@ fn search_once(opts: &SearchOptions) -> anyhow::Result<SearchResult> {
     }
 
     let deadline = opts.match_timeout.map(|t| Instant::now() + t);
+    // Private native-client integration: close the real ENet ticket gracefully
+    // when the guest cancels from its waiting room, instead of killing the process.
+    let private_cancel = std::env::var_os("BRAWL_PRIVATE_CANCEL_FILE").map(std::path::PathBuf::from);
     let resp = loop {
-        let wait = match deadline {
+        if private_cancel.as_ref().is_some_and(|p| p.exists()) {
+            result.status = Status::MmDisconnected;
+            result.error = Some("Search cancelled".into());
+            result.mm_disconnect = Some(disconnect_mm(&mut host, mm));
+            return Ok(result);
+        }
+        let mut wait = match deadline {
             Some(d) => d.saturating_duration_since(Instant::now()).min(Duration::from_secs(2)),
             None => Duration::from_secs(2),
         };
+        if private_cancel.is_some() {
+            wait = wait.min(Duration::from_millis(50));
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             result.status = Status::MatchTimeout;
             result.error = Some("No match before the client timeout".into());
