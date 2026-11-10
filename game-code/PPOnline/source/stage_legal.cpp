@@ -366,6 +366,19 @@ extern "C" {
     // Anyone picks: leave at once with SESSION's stage (the host took the first pick).
     static bool s_anyLeave = false;
 
+    // An automatic exit has no physical A press. buttonProc otherwise searches all
+    // eight pads, gets -1, and indexes its controller-type table using the word
+    // before pad 0 (0x805BA480), producing the invalid read at 0x8348B5C8.
+    // Attribute this final confirmation to the controller that locked in. The
+    // task is leaving; normal stage browsing continues to accept all controllers.
+    static u32 confirmAutomaticExit(u8* task, u32 buttons)
+    {
+        const u32 pad = PPOM::g_block.local.lockPad;
+        if (pad >= 8) __builtin_trap();
+        *(u32*)(task + 0x278) = pad;
+        return buttons | 0x100u;
+    }
+
     // H1: returns the pressed buttons the rest of buttonProc (P+'s hooks) sees in r3.
     __attribute__((used)) u32 pponline_sssButtons(u8* task, u32 pressed)
     {
@@ -382,7 +395,7 @@ extern "C" {
             s_anyLeave = any == OnlineMenu::ANY_DECIDED || any == OnlineMenu::ANY_GONE;
             if (s_anyLeave) {
                 if (*hovered - 0x30u <= 7u) *hovered = 0;
-                return out | 0x100u;
+                return confirmAutomaticExit(task, out);
             }
             // One page for everyone (Sarah's board, 2026-10-29): another player turned the page,
             // so this stage select turns too, with P+'s own page button (an A on it, as when the
@@ -434,7 +447,7 @@ extern "C" {
             // takes the stage pponline_sssFilterPos gives; setHover sets +0x244 again next frame.
             u32* hovered = (u32*)(task + 0x244);
             if (*hovered - 0x30u <= 7u) *hovered = 0;
-            return out | 0x100u;
+            return confirmAutomaticExit(task, out);
         }
         if (!(st->myTurn && st->type == PPOM::STEP_PICK)) out &= ~0x100u;   // A only to pick
         if (st->myTurn && st->type == PPOM::STEP_STRIKE && (pressed & (0x400u | 0x80000u))) {
